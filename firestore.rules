@@ -1,0 +1,623 @@
+rules_version = '2';
+
+// Project Altair - server-side authorization (works on Firebase's free plan).
+// The app hides buttons a member may not use, but THIS file is what
+// actually protects the data: every read and write is checked here.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── who is asking ────────────────────────────────────────────────
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    // The caller's own account document. It can only be created by a
+    // Super Admin (see /users below), so having one is what makes a
+    // signed-in phone a team member.
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function role() {
+      return me().role;
+    }
+
+    // Signed in, has an account made by an administrator, has a team role,
+    // and has not been disabled. A disabled account is refused at once.
+    function isMember() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && me().get('disabled', false) != true
+        && role() in ['superAdmin', 'teamLead', 'senior', 'junior',
+                      'advisor', 'moderator'];
+    }
+
+    function isLead() {
+      return isMember() && role() in ['superAdmin', 'teamLead'];
+    }
+
+    function isAdmin() {
+      return isMember() && role() == 'superAdmin';
+    }
+
+    function changedOnly(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // ── accounts ─────────────────────────────────────────────────────
+
+    function validAccount(d) {
+      return d.userId is string && d.userId.size() >= 3 && d.userId.size() <= 32
+        && d.fullName is string && d.fullName.size() > 0 && d.fullName.size() <= 80
+        && d.role in ['superAdmin', 'teamLead', 'senior', 'junior',
+                      'advisor', 'moderator']
+        && d.position is string && d.position.size() <= 60
+        && d.subTeamId is string && d.subTeamName is string
+        && d.photoUrl is string && d.photoUrl.size() < 1000
+        && d.disabled is bool
+        && d.mustChangePassword is bool;
+    }
+
+    match /users/{userId} {
+      // Everyone may read their own account (that is how a phone learns it
+      // was disabled). The list of accounts is for members only.
+      allow get: if request.auth != null && (uid() == userId || isMember());
+      allow list: if isMember();
+
+      // Only a Super Admin can create an account, and never their own.
+      // Anyone who signs up without one stays locked out of everything.
+      allow create: if isAdmin()
+        && uid() != userId
+        && validAccount(request.resource.data)
+        && request.resource.data.disabled == false
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if isMember() && (
+        // A Super Admin edits an account. Nobody can change their own role
+        // or disable themself, so the team always keeps an administrator.
+        (
+          isAdmin()
+          && validAccount(request.resource.data)
+          && changedOnly(['fullName', 'role', 'position', 'subTeamId',
+                          'subTeamName', 'disabled', 'updatedAt'])
+          && (uid() != userId
+              || (request.resource.data.role == resource.data.role
+                  && request.resource.data.disabled == resource.data.disabled))
+        )
+        ||
+        // A member changes their own picture, or switches off the
+        // "choose your own password" reminder after doing so.
+        (
+          uid() == userId
+          && changedOnly(['photoUrl', 'mustChangePassword', 'updatedAt'])
+          && request.resource.data.photoUrl is string
+          && request.resource.data.photoUrl.size() < 1000
+          && (request.resource.data.get('mustChangePassword', false)
+                == resource.data.get('mustChangePassword', false)
+              || request.resource.data.get('mustChangePassword', false) == false)
+        )
+      );
+
+      // A Super Admin deletes an account (never their own). The sign-in is
+      // removed by the Apps Script, from /accountDeletions below.
+      allow delete: if isAdmin() && uid() != userId;
+    }
+
+    // Notes asking the Apps Script to delete a removed member's sign-in.
+    match /accountDeletions/{accountId} {
+      allow read, delete: if isAdmin();
+      allow create: if isAdmin()
+        && uid() != accountId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'fullName', 'requestedById', 'createdAt'])
+        && request.resource.data.userId is string
+        && request.resource.data.fullName is string
+        && request.resource.data.requestedById == uid()
+        && request.resource.data.createdAt == request.time;
+    }
+
+    // Profile pictures: small JPEGs stored as Base64 text, one per
+    // document, read one at a time. They can be replaced but never edited.
+    match /photos/{photoId} {
+      allow get: if isMember();
+      allow list: if false;
+      allow create: if isMember()
+        && request.resource.data.keys().hasOnly(['image', 'ownerId', 'createdAt'])
+        && request.resource.data.image is string
+        && request.resource.data.image.size() < 1000000
+        && request.resource.data.ownerId == uid()
+        && request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if isMember()
+        && (resource.data.ownerId == uid() || isLead());
+    }
+
+    // Used once per session to measure the phone-to-server clock offset.
+    match /clockSync/{userId} {
+      allow read: if request.auth != null && uid() == userId;
+      allow create, update: if isMember()
+        && uid() == userId
+        && request.resource.data.keys().hasOnly(['ts'])
+        && request.resource.data.ts == request.time;
+      allow delete: if false;
+    }
+
+    // ── sub-teams ────────────────────────────────────────────────────
+
+    // ── join requests: people asking for an account ──────────────────
+    // Anyone can make a sign-in from the app, but it stays locked out of
+    // everything else. They may send one request, for themselves, while
+    // they have no account. Only a Super Admin can read the requests and
+    // decide; approving creates the account (see /users) and the card.
+
+    function validJoinRequest(d) {
+      return d.keys().hasOnly(['userId', 'fullName', 'studentId', 'group',
+            'position', 'subTeamId', 'subTeamName', 'phone', 'whatsapp',
+            'messengerLink', 'photo', 'status', 'createdAt'])
+        && d.userId is string
+        && d.userId == request.auth.token.email.split('@')[0]
+        && d.fullName is string && d.fullName.size() > 0 && d.fullName.size() <= 80
+        && d.studentId is string && d.studentId.size() > 0 && d.studentId.size() <= 20
+        && d.group in ['juniorMembers', 'seniorMembers', 'teamLeads',
+                       'advisors', 'moderators']
+        && d.position is string && d.position.size() <= 60
+        && d.subTeamId is string && d.subTeamId.size() <= 128
+        && d.subTeamName is string && d.subTeamName.size() <= 40
+        && d.phone is string && d.phone.size() <= 30
+        && d.whatsapp is string && d.whatsapp.size() <= 30
+        && d.messengerLink is string && d.messengerLink.size() <= 300
+        && d.photo is string && d.photo.size() > 0 && d.photo.size() < 1000000
+        && d.status == 'pending'
+        && d.createdAt == request.time;
+    }
+
+    match /joinRequests/{applicantId} {
+      allow get: if request.auth != null
+        && (uid() == applicantId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if request.auth != null
+        && uid() == applicantId
+        && !exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && !exists(/databases/$(database)/documents/accountDeletions/$(request.auth.uid))
+        && validJoinRequest(request.resource.data);
+      // Rejecting keeps a short record and drops the picture.
+      allow update: if isAdmin()
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'rejected'
+        && request.resource.data.photo == ''
+        && changedOnly(['status', 'photo', 'decidedById', 'decidedByName',
+             'decidedAt'])
+        && request.resource.data.decidedById == uid();
+      // Approving removes it; the applicant may cancel their own.
+      allow delete: if isAdmin()
+        || (request.auth != null && uid() == applicantId);
+    }
+
+    match /subTeams/{subTeamId} {
+      // Names only. Someone filling in a join request picks theirs here.
+      allow read: if request.auth != null;
+      allow create, update: if isAdmin()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 40
+        && request.resource.data.order is int;
+      allow delete: if isAdmin();
+    }
+
+    // ── live tasks ───────────────────────────────────────────────────
+
+    function validTask(d) {
+      return d.title is string && d.title.size() > 0 && d.title.size() <= 120
+        && d.description is string && d.description.size() <= 2000
+        && d.responsibleId is string && d.responsibleName is string
+        && d.subTeamId is string && d.subTeamName is string
+        && (d.scheduledAt == null || d.scheduledAt is timestamp)
+        && (d.get('dueAt', null) == null || d.dueAt is timestamp)
+        && d.priority in ['', 'low', 'normal', 'high', 'critical'];
+    }
+
+    function taskEditKeys() {
+      return ['title', 'description', 'responsibleId', 'responsibleName',
+              'subTeamId', 'subTeamName', 'scheduledAt', 'priority', 'dueAt',
+              'updatedAt'];
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isMember();
+
+      // Any member can add a task. It always starts as "pending" with no
+      // timing, stamped with the server time and the real creator.
+      allow create: if isMember()
+        && validTask(request.resource.data)
+        && request.resource.data.status == 'pending'
+        && request.resource.data.startedAt == null
+        && request.resource.data.endedAt == null
+        && request.resource.data.createdById == uid()
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if isMember() && (
+        // START: only pending -> inProgress, only the timing fields, and the
+        // start time MUST be the server clock. Allowed for the responsible
+        // member, the creator, team leads and admins.
+        (
+          resource.data.status == 'pending'
+          && request.resource.data.status == 'inProgress'
+          && request.resource.data.startedAt == request.time
+          && request.resource.data.startedById == uid()
+          && changedOnly(['status', 'startedAt', 'startedById', 'startedByName', 'updatedAt'])
+          && (isLead()
+              || resource.data.responsibleId == uid()
+              || resource.data.createdById == uid())
+        )
+        ||
+        // EDIT: team leads and admins may change the description fields,
+        // never the status or any recorded time.
+        (
+          isLead()
+          && validTask(request.resource.data)
+          && changedOnly(taskEditKeys())
+        )
+        ||
+        // CHECKLIST: whoever may end the task can edit its steps.
+        (
+          changedOnly(['checklist', 'updatedAt'])
+          && request.resource.data.checklist is list
+          && request.resource.data.checklist.size() <= 40
+          && (isLead()
+              || resource.data.responsibleId == uid()
+              || resource.data.createdById == uid()
+              || resource.data.get('startedById', '') == uid())
+        )
+      );
+
+      // Team leads and admins may delete a task. Everyone else can only
+      // remove it as part of END TASK, i.e. in the same atomic write that
+      // creates its History record (checked in /taskHistory below).
+      allow delete: if isLead()
+        || (
+          isMember()
+          && resource.data.status == 'inProgress'
+          && !exists(/databases/$(database)/documents/taskHistory/$(taskId))
+          && existsAfter(/databases/$(database)/documents/taskHistory/$(taskId))
+        );
+    }
+
+    // ── task comments ────────────────────────────────────────────────
+    // Kept under the task's id, so they stay readable after the task
+    // moves to History.
+
+    match /tasks/{taskId}/comments/{commentId} {
+      allow read: if isMember();
+      allow create: if isMember()
+        && request.resource.data.keys().hasOnly(
+             ['text', 'authorId', 'authorName', 'createdAt'])
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 1000
+        && request.resource.data.authorId == uid()
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() <= 80
+        && request.resource.data.createdAt == request.time;
+      allow delete: if isLead()
+        || (isMember() && resource.data.authorId == uid());
+    }
+
+    // ── task history ─────────────────────────────────────────────────
+
+    function endsTask(task, record) {
+      return task.status == 'inProgress'
+        && record.status == 'completed'
+        && record.endedAt == request.time
+        && record.endedById == uid()
+        && record.startedAt == task.startedAt
+        && record.startedById == task.startedById
+        && record.createdById == task.createdById
+        && record.responsibleId == task.responsibleId
+        && record.title == task.title
+        && (isLead()
+            || task.responsibleId == uid()
+            || task.startedById == uid()
+            || task.createdById == uid());
+    }
+
+    match /taskHistory/{taskId} {
+      allow read: if isMember();
+
+      // END TASK: the record must be a faithful copy of the running task,
+      // end-stamped with the server clock, and the live task must disappear
+      // in the same write.
+      allow create: if isMember()
+        && exists(/databases/$(database)/documents/tasks/$(taskId))
+        && !existsAfter(/databases/$(database)/documents/tasks/$(taskId))
+        && endsTask(
+             get(/databases/$(database)/documents/tasks/$(taskId)).data,
+             request.resource.data);
+
+      // Only Super Admins may correct or delete history, and even they
+      // cannot alter the recorded start and end times.
+      allow update: if isAdmin()
+        && validTask(request.resource.data)
+        && changedOnly(taskEditKeys());
+      allow delete: if isAdmin();
+    }
+
+    // ── shared notes ─────────────────────────────────────────────────
+
+    function validNote(d) {
+      return d.title is string && d.title.size() > 0 && d.title.size() <= 120
+        && d.content is string && d.content.size() <= 5000
+        && d.category is string && d.category.size() <= 30
+        && d.pinned is bool
+        && d.important is bool;
+    }
+
+    match /notes/{noteId} {
+      allow read: if isMember();
+
+      allow create: if isMember()
+        && validNote(request.resource.data)
+        && request.resource.data.authorId == uid()
+        && request.resource.data.createdAt == request.time
+        && (request.resource.data.pinned == false || isLead());
+
+      allow update: if isMember()
+        && validNote(request.resource.data)
+        && changedOnly(['title', 'content', 'category', 'pinned', 'important', 'updatedAt'])
+        && (
+          // an admin can moderate any note
+          isAdmin()
+          // the author can edit their own note (only leads may change the pin)
+          || (resource.data.authorId == uid()
+              && (request.resource.data.pinned == resource.data.pinned || isLead()))
+          // a team lead can pin or unpin any note
+          || (isLead() && changedOnly(['pinned', 'updatedAt']))
+        );
+
+      // DONE: any member can tick a note off (signed with their own id and
+      // the server clock) or reopen it.
+      allow update: if isMember()
+        && changedOnly(['done', 'doneById', 'doneByName', 'doneAt'])
+        && (
+          (request.resource.data.done == true
+            && request.resource.data.doneById == uid()
+            && request.resource.data.doneByName is string
+            && request.resource.data.doneByName.size() <= 80
+            && request.resource.data.doneAt == request.time)
+          ||
+          (request.resource.data.done == false
+            && request.resource.data.doneById == ''
+            && request.resource.data.doneByName == ''
+            && request.resource.data.doneAt == null)
+        );
+
+      allow delete: if isAdmin() || (isMember() && resource.data.authorId == uid());
+    }
+
+    // ── member directories (three separate collections) ──────────────
+
+    function validMember(d) {
+      return d.fullName is string && d.fullName.size() > 0 && d.fullName.size() <= 80
+        && d.position is string && d.position.size() <= 60
+        && d.subTeamId is string && d.subTeamName is string
+        && d.phone is string && d.phone.size() <= 30
+        && d.whatsapp is string && d.whatsapp.size() <= 30
+        && d.messengerLink is string && d.messengerLink.size() <= 300
+        && d.photoUrl is string && d.photoUrl.size() < 1000
+        && d.get('tier', '') in ['', 'lead', 'executive']
+        && d.get('wing', '') in ['', 'management', 'technical', 'scientific']
+        && d.get('reportsTo', '') is string && d.get('reportsTo', '').size() <= 128
+        && d.get('order', 0) is int && d.get('order', 0) >= 0
+        && d.get('order', 0) <= 999;
+    }
+
+    // A senior or junior member may keep one card of their own: its ID is
+    // their account ID, and it lives in the directory that matches their role.
+    function ownCard(memberId, ownRole) {
+      return isMember() && memberId == uid() && role() == ownRole;
+    }
+
+    match /teamLeads/{memberId} {
+      allow read: if isMember();
+      allow create, update: if isLead() && validMember(request.resource.data);
+      allow delete: if isLead();
+    }
+
+    match /seniorMembers/{memberId} {
+      allow read: if isMember();
+      allow create, update: if (isLead() || ownCard(memberId, 'senior'))
+        && validMember(request.resource.data);
+      allow delete: if isLead();
+    }
+
+    match /juniorMembers/{memberId} {
+      allow read: if isMember();
+      allow create, update: if (isLead() || ownCard(memberId, 'junior'))
+        && validMember(request.resource.data);
+      allow delete: if isLead();
+    }
+
+    // Advisors and moderators: added and edited by team leads only.
+    match /advisors/{memberId} {
+      allow read: if isMember();
+      allow create, update: if (isLead() || ownCard(memberId, 'advisor'))
+        && validMember(request.resource.data);
+      allow delete: if isLead();
+    }
+
+    match /moderators/{memberId} {
+      allow read: if isMember();
+      allow create, update: if (isLead() || ownCard(memberId, 'moderator'))
+        && validMember(request.resource.data);
+      allow delete: if isLead();
+    }
+
+    // ── team hub: inventory ──────────────────────────────────────────
+
+    function validItem(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 80
+        && d.category is string && d.category.size() <= 40
+        && d.quantity is int && d.quantity >= 0 && d.quantity <= 999999
+        && d.location is string && d.location.size() <= 80
+        && d.notes is string && d.notes.size() <= 500
+        && d.borrowedById is string
+        && d.borrowedByName is string && d.borrowedByName.size() <= 80
+        && (d.borrowedAt == null || d.borrowedAt is timestamp);
+    }
+
+    function holderKeys() {
+      return ['borrowedById', 'borrowedByName', 'borrowedAt', 'updatedAt'];
+    }
+
+    match /inventory/{itemId} {
+      allow read: if isMember();
+
+      // Team leads keep the list. A new item always starts in its place.
+      allow create: if isLead()
+        && validItem(request.resource.data)
+        && request.resource.data.borrowedById == '';
+
+      allow update: if isMember() && validItem(request.resource.data) && (
+        // A team lead edits the description, never who holds the item.
+        (
+          isLead()
+          && changedOnly(['name', 'category', 'quantity', 'location', 'notes',
+                          'updatedAt'])
+        )
+        ||
+        // TAKE: only a free item, only for yourself, stamped by the server.
+        (
+          resource.data.borrowedById == ''
+          && request.resource.data.borrowedById == uid()
+          && request.resource.data.borrowedAt == request.time
+          && changedOnly(holderKeys())
+        )
+        ||
+        // RETURN: by whoever holds it, or by a team lead.
+        (
+          (resource.data.borrowedById == uid() || isLead())
+          && request.resource.data.borrowedById == ''
+          && request.resource.data.borrowedByName == ''
+          && request.resource.data.borrowedAt == null
+          && changedOnly(holderKeys())
+        )
+      );
+
+      allow delete: if isLead();
+    }
+
+    // ── team hub: calendar ───────────────────────────────────────────
+
+    function validEvent(d) {
+      return d.title is string && d.title.size() > 0 && d.title.size() <= 100
+        && d.type in ['meeting', 'test', 'deadline', 'other']
+        && d.at is timestamp
+        && d.location is string && d.location.size() <= 80
+        && d.notes is string && d.notes.size() <= 500;
+    }
+
+    match /events/{eventId} {
+      allow read: if isMember();
+      allow create: if isLead()
+        && validEvent(request.resource.data)
+        && request.resource.data.createdById == uid();
+      allow update: if isLead()
+        && validEvent(request.resource.data)
+        && changedOnly(['title', 'type', 'at', 'location', 'notes', 'updatedAt']);
+      allow delete: if isLead();
+    }
+
+    // ── expense log ──────────────────────────────────────────────────
+
+    match /expenses/{expenseId} {
+      // A member sees their own entries; team leads see everyone's.
+      allow read: if isLead()
+        || (isMember() && resource.data.createdById == uid());
+      allow create: if isMember()
+        && request.resource.data.keys().hasOnly(
+             ['reason', 'amount', 'bkash', 'receiptUrl', 'createdById',
+              'createdByName', 'createdAt'])
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.reason.size() <= 300
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.amount <= 10000000
+        && request.resource.data.bkash is string
+        && request.resource.data.bkash.matches('[0-9]{11,14}')
+        && request.resource.data.receiptUrl is string
+        && request.resource.data.receiptUrl.matches('db:[A-Za-z0-9]{1,40}')
+        && request.resource.data.createdById == uid()
+        && request.resource.data.createdByName is string
+        && request.resource.data.createdByName.size() <= 80
+        && request.resource.data.createdAt == request.time;
+      allow delete: if isLead()
+        || (isMember() && resource.data.createdById == uid());
+    }
+
+    // ── polls ────────────────────────────────────────────────────────
+
+    match /polls/{pollId} {
+      allow read: if isMember();
+      allow create: if isMember()
+        && request.resource.data.keys().hasOnly(
+             ['question', 'options', 'votes', 'closed', 'createdById',
+              'createdByName', 'createdAt', 'updatedAt'])
+        && request.resource.data.question is string
+        && request.resource.data.question.size() > 0
+        && request.resource.data.question.size() <= 200
+        && request.resource.data.options is list
+        && request.resource.data.options.size() >= 2
+        && request.resource.data.options.size() <= 6
+        && request.resource.data.votes is map
+        && request.resource.data.votes.size() == 0
+        && request.resource.data.closed == false
+        && request.resource.data.createdById == uid()
+        && request.resource.data.createdByName is string
+        && request.resource.data.createdAt == request.time;
+      allow update: if isMember() && (
+        // VOTE: only your own entry, only while open, only a real option.
+        (
+          resource.data.closed == false
+          && changedOnly(['votes', 'updatedAt'])
+          && request.resource.data.votes.diff(resource.data.votes)
+               .affectedKeys().hasOnly([uid()])
+          && request.resource.data.votes[uid()] is int
+          && request.resource.data.votes[uid()] >= 0
+          && request.resource.data.votes[uid()] < resource.data.options.size()
+        )
+        ||
+        // CLOSE or REOPEN: the creator or a team lead.
+        (
+          (isLead() || resource.data.createdById == uid())
+          && changedOnly(['closed', 'updatedAt'])
+          && request.resource.data.closed is bool
+        )
+      );
+      allow delete: if isLead()
+        || (isMember() && resource.data.createdById == uid());
+    }
+
+    // ── activity log ─────────────────────────────────────────────────
+
+    // Each phone adds a line after an action. A line must be signed with
+    // the writer's own account and the server's clock, and can never be
+    // changed or removed. Only Super Admins can read the log.
+    match /activityLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isMember()
+        && request.resource.data.keys().hasOnly(
+             ['type', 'message', 'actorId', 'actorName', 'createdAt'])
+        && request.resource.data.type is string
+        && request.resource.data.type.size() <= 40
+        && request.resource.data.message is string
+        && request.resource.data.message.size() <= 500
+        && request.resource.data.actorId == uid()
+        && request.resource.data.actorName is string
+        && request.resource.data.actorName.size() <= 80
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+  }
+}

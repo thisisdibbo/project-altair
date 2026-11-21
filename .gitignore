@@ -1,0 +1,45 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+*.iml
+.idea/
+.vscode/
+
+# Android
+android/.gradle/
+android/local.properties
+android/key.properties
+android/app/*.jks
+android/app/*.keystore
+**/android/captures/
+
+# iOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+**/xcuserdata/
+**/DerivedData/
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+tools/node_modules/
+tools/serviceAccountKey.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep keys and one-off update scripts off GitHub
+*.jks
+*.keystore
+*serviceAccount*.json
+tools/apply-*.mjs

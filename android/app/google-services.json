@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "45211432926",
+    "project_id": "analytics-off-1801f",
+    "storage_bucket": "analytics-off-1801f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:45211432926:android:70965e99ab7e13c5c58f4f",
+        "android_client_info": {
+          "package_name": "com.projectaltair.project_altair"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCnYVTSSxIbmIZjBgrMqbPuKxNTVH77uP4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
